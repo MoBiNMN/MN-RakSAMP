@@ -1,0 +1,400 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.44.6'
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      version_code: ${{ steps.tag.outputs.version_code }}
+    steps:
+      - name: Check tag format and version ordering
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a release tag. Expected vX.Y.Z, for example v1.0.0."
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          for part in "$MAJOR" "$MINOR" "$PATCH"; do
+            if [ "$((10#$part))" -gt 999 ]; then
+              echo "::error::Version component '$part' is larger than 999; the versionCode mapping would overflow."
+              exit 1
+            fi
+          done
+
+          # major*1000000 + minor*1000 + patch: strictly increasing for any
+          # vX.Y.Z bump and well below the Android limit of 2100000000.
+          VERSION_CODE=$(( 10#$MAJOR * 1000000 + 10#$MINOR * 1000 + 10#$PATCH ))
+          if [ "$VERSION_CODE" -lt 1 ]; then
+            echo "::error::Computed versionCode is $VERSION_CODE; Android requires at least 1. Use a version >= 0.0.1."
+            exit 1
+          fi
+
+          # Refuse to publish a version that is not newer than what is already
+          # out there: re-tagging an old commit would otherwise ship a lower
+          # versionCode and break in-place updates on devices.
+          RELEASES=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100" || true)
+          PREV=$(printf '%s' "$RELEASES" \
+            | jq -r '.[] | select(.draft == false) | .tag_name' 2>/dev/null \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n 1 || true)
+
+          if [ -n "$PREV" ] && [ "$PREV" != "$TAG" ]; then
+            if [ "$(printf '%s\n%s\n' "$PREV" "$TAG" | sort -V | tail -n 1)" != "$TAG" ]; then
+              echo "::error::Tag '$TAG' is not newer than the latest published release '$PREV'. Bump the version."
+              exit 1
+            fi
+            echo "Previous release: $PREV"
+          else
+            echo "No previous release found - this will be the first one."
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "Release $VERSION (versionCode $VERSION_CODE)"
+
+  android:
+    name: Android APKs
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Restore and verify release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${KEYSTORE_BASE64:-}" ] && missing+=("ANDROID_KEYSTORE_BASE64")
+          [ -z "${STORE_PASSWORD:-}" ] && missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [ -z "${KEY_PASSWORD:-}" ] && missing+=("ANDROID_KEY_PASSWORD")
+          [ -z "${KEY_ALIAS:-}" ] && missing+=("ANDROID_KEY_ALIAS")
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "::error::Missing Android signing secret(s): ${missing[*]}. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # android/app/build.gradle.kts resolves storeFile against rootProject
+          # (android/), so storeFile=app/upload-keystore.jks points here.  Both
+          # files are git-ignored and never committed.
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+          if [ ! -s android/app/upload-keystore.jks ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 did not decode to a keystore file."
+            exit 1
+          fi
+
+          cat > android/key.properties <<EOF
+          storePassword=$STORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=app/upload-keystore.jks
+          EOF
+
+          # The alias must exist and open with the supplied passwords.
+          if ! keytool -list -keystore android/app/upload-keystore.jks \
+                 -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::error::Keystore does not contain alias '$KEY_ALIAS', or ANDROID_KEYSTORE_PASSWORD is wrong."
+            exit 1
+          fi
+
+          # Keep the signing certificate so the built APKs can be checked
+          # against it after the build.
+          keytool -list -v -keystore android/app/upload-keystore.jks \
+            -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" \
+            | sed -n 's/.*SHA256: //p' | head -n 1 \
+            | tr -d ': ' | tr '[:upper:]' '[:lower:]' > "$RUNNER_TEMP/expected_sha256.txt"
+          echo "Expected signer SHA-256: $(cat "$RUNNER_TEMP/expected_sha256.txt")"
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build release APKs
+        run: |
+          set -euo pipefail
+          flutter build apk --release \
+            --build-name="${{ needs.validate.outputs.version }}" \
+            --build-number="${{ needs.validate.outputs.version_code }}"
+
+      - name: Verify every APK is signed with the release keystore
+        run: |
+          set -euo pipefail
+          EXPECTED=$(cat "$RUNNER_TEMP/expected_sha256.txt")
+          APKSIGNER=$(ls -1 "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found in the Android SDK build-tools"
+            exit 1
+          fi
+
+          APKS=(
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            build/app/outputs/flutter-apk/app-x86_64-release.apk
+            build/app/outputs/flutter-apk/app-release.apk
+          )
+          for apk in "${APKS[@]}"; do
+            if [ ! -f "$apk" ]; then
+              echo "::error::Expected APK not produced: $apk"
+              exit 1
+            fi
+            GOT=$("$APKSIGNER" verify --print-certs "$apk" \
+              | sed -n 's/.*certificate SHA-256 digest: //p' | head -n 1 \
+              | tr -d ': ' | tr '[:upper:]' '[:lower:]')
+            if [ "$GOT" != "$EXPECTED" ]; then
+              echo "::error::$apk is signed by '$GOT', expected '$EXPECTED' (debug key?)"
+              exit 1
+            fi
+            echo "OK  $(basename "$apk")  signer=$GOT"
+          done
+
+      - name: Rename APKs with the version
+        run: |
+          set -euo pipefail
+          cd build/app/outputs/flutter-apk
+          V="${{ needs.validate.outputs.version }}"
+          mv app-arm64-v8a-release.apk   "MN-RakSAMP-${V}-arm64-v8a.apk"
+          mv app-armeabi-v7a-release.apk "MN-RakSAMP-${V}-armeabi-v7a.apk"
+          mv app-x86_64-release.apk      "MN-RakSAMP-${V}-x86_64.apk"
+          mv app-release.apk             "MN-RakSAMP-${V}-universal.apk"
+          ls -lh MN-RakSAMP-*.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: build/app/outputs/flutter-apk/MN-RakSAMP-*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows portable + setup
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build Windows release
+        run: >
+          flutter build windows --release
+          --build-name="${{ needs.validate.outputs.version }}"
+          --build-number=1
+
+      - name: Verify release bundle
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem "build\windows" -Recurse -Filter "MN-RakSAMP.exe" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) { throw "MN-RakSAMP.exe not found under build\windows" }
+          $src = $exe.DirectoryName
+          Write-Host "Release folder: $src"
+
+          # Flutter does not ship the Visual C++ runtime. Copy it next to the
+          # exe so the portable ZIP and the installer both run on a clean
+          # Windows without the Visual C++ Redistributable.
+          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            $from = Join-Path $env:WINDIR "System32\$dll"
+            if (-not (Test-Path $from)) { throw "$dll not found in System32" }
+            Copy-Item $from $src -Force
+          }
+
+          # Everything the app needs at runtime: the exe, the Flutter engine
+          # DLL, the native RakNet core (FFI) and the data folder.
+          $required = @(
+            "MN-RakSAMP.exe",
+            "flutter_windows.dll",
+            "MNRakSAMPCore.dll",
+            "vcruntime140.dll",
+            "msvcp140.dll",
+            "data\icudtl.dat",
+            "data\flutter_assets\AssetManifest.bin"
+          )
+          foreach ($rel in $required) {
+            if (-not (Test-Path (Join-Path $src $rel))) { throw "Release bundle is missing $rel" }
+          }
+
+          # The installer needs its icon source.
+          if (-not (Test-Path "assets\app_icon.ico")) { throw "assets\app_icon.ico is missing" }
+
+          $files = Get-ChildItem $src -Recurse -File
+          Write-Host ("Bundle: {0} files, {1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB))
+
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          $v   = "${{ needs.validate.outputs.version }}"
+          $exe = Get-ChildItem "build\windows" -Recurse -Filter "MN-RakSAMP.exe" | Select-Object -First 1
+          $src = $exe.DirectoryName
+          $zip = "MN-RakSAMP-$v-windows-portable.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -CompressionLevel Optimal -Force
+          Write-Host "Portable package: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
+
+          # Prove the archive really contains a runnable copy.
+          $tmp = Join-Path $env:RUNNER_TEMP "zipcheck"
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          foreach ($rel in @("MN-RakSAMP.exe", "flutter_windows.dll", "MNRakSAMPCore.dll", "vcruntime140.dll", "data\icudtl.dat")) {
+            if (-not (Test-Path (Join-Path $tmp $rel))) { throw "Portable ZIP is missing $rel" }
+          }
+          $n = (Get-ChildItem $tmp -Recurse -File).Count
+          $m = (Get-ChildItem $src -Recurse -File).Count
+          if ($n -ne $m) { throw "Portable ZIP has $n files, release folder has $m" }
+          Write-Host "Portable ZIP verified: $n files"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after installing Inno Setup" }
+
+      - name: Build setup EXE
+        shell: pwsh
+        run: |
+          $v    = "${{ needs.validate.outputs.version }}"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          $exe  = Get-ChildItem "build\windows" -Recurse -Filter "MN-RakSAMP.exe" | Select-Object -First 1
+          & $iscc `
+            "/DMyAppVersion=$v" `
+            "/DMySourceDir=$($exe.DirectoryName)" `
+            "/DMyOutputDir=$PWD\dist" `
+            "windows\installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          $setup = "dist\MN-RakSAMP-$v-windows-setup.exe"
+          if (-not (Test-Path $setup)) { throw "Installer was not produced at $setup" }
+          if ((Get-Item $setup).Length -lt 5MB) { throw "Installer looks too small: $((Get-Item $setup).Length) bytes" }
+          Write-Host ("Installer: {0} ({1:N1} MB)" -f $setup, ((Get-Item $setup).Length / 1MB))
+
+      - name: Smoke-test installer (install, upgrade, uninstall)
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem "dist" -Filter "*-windows-setup.exe" | Select-Object -First 1).FullName
+          if (-not $setup) { throw "No setup EXE found in dist" }
+          $dir = Join-Path $env:RUNNER_TEMP "mninstall"
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+
+          function Install-Once([string]$label) {
+            $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
+              "/DIR=`"$dir`"",
+              "/LOG=`"$env:RUNNER_TEMP\$label.log`""
+            )
+            if ($p.ExitCode -ne 0) { throw "Installer ($label) exited with $($p.ExitCode)" }
+            foreach ($rel in @("MN-RakSAMP.exe", "MNRakSAMPCore.dll", "data\icudtl.dat")) {
+              if (-not (Test-Path (Join-Path $dir $rel))) { throw "Install ($label) is missing $rel" }
+            }
+            if (-not (Test-Path (Join-Path $dir "unins000.exe"))) { throw "Uninstaller missing after $label" }
+            Write-Host "Install ($label) OK -> $dir"
+          }
+
+          Install-Once "first-install"
+          # Running the same setup again exercises the upgrade path; the fixed
+          # AppId makes it replace the previous install instead of stacking.
+          Install-Once "upgrade"
+
+          # Silent uninstall must remove the app files.
+          $un = Start-Process -FilePath (Join-Path $dir "unins000.exe") -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          )
+          if ($un.ExitCode -ne 0) { throw "Uninstaller exited with $($un.ExitCode)" }
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Test-Path (Join-Path $dir "MN-RakSAMP.exe"))) { break }
+            Start-Sleep -Seconds 1
+          }
+          if (Test-Path (Join-Path $dir "MN-RakSAMP.exe")) { throw "Uninstall left MN-RakSAMP.exe behind" }
+          Write-Host "Uninstall OK - $dir is clean"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-builds
+          path: |
+            MN-RakSAMP-*-windows-portable.zip
+            dist/MN-RakSAMP-*-windows-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate, android, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify all six assets
+        run: |
+          set -euo pipefail
+          find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
+          ls -lh artifacts
+          V="${{ needs.validate.outputs.version }}"
+          for f in \
+            "MN-RakSAMP-$V-arm64-v8a.apk" \
+            "MN-RakSAMP-$V-armeabi-v7a.apk" \
+            "MN-RakSAMP-$V-x86_64.apk" \
+            "MN-RakSAMP-$V-universal.apk" \
+            "MN-RakSAMP-$V-windows-portable.zip" \
+            "MN-RakSAMP-$V-windows-setup.exe"; do
+            if [ ! -f "artifacts/$f" ]; then
+              echo "::error::Missing release asset: $f"
+              exit 1
+            fi
+          done
+          echo "All six assets present"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
